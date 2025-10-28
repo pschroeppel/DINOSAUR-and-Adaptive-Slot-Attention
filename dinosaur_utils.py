@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+from sklearn.decomposition import PCA
 
 import shutil
 from torch.utils.tensorboard import SummaryWriter
@@ -17,6 +18,83 @@ import numpy as np
 from sklearn.metrics.cluster import adjusted_rand_score
 
 from datasets import pascal, coco
+
+
+class PCAWrapper:
+    def __init__(self, pca, which_pca_components=None, pca_descriptors_min=None, pca_descriptors_max=None):
+        self.pca = pca
+        self.mean_ = pca.mean_
+        self.components_ = pca.components_
+        self.n_components_ = pca.n_components_
+        
+        self.pca_descriptors_min = pca_descriptors_min
+        self.pca_descriptors_max = pca_descriptors_max
+        self.which_pca_components = which_pca_components
+        
+    def transform(self, x):
+        return self.pca.transform(x)
+
+
+class TorchPCA(PCAWrapper):
+    def __init__(self, pca, device=None, dtype=torch.float32):
+        self.mean_ = torch.tensor(pca.mean_, dtype=dtype, device=device)[None]
+        self.components_ = torch.tensor(pca.components_, dtype=dtype, device=device)
+        self.n_components_ = pca.n_components_
+               
+        self.pca_descriptors_min = torch.tensor(pca.pca_descriptors_min, dtype=dtype, device=device)
+        self.pca_descriptors_max = torch.tensor(pca.pca_descriptors_max, dtype=dtype, device=device)
+        self.which_pca_components = pca.which_pca_components
+
+    def transform(self, X, normalize=False):
+        Y = torch.matmul(X, self.components_.T)
+        Y -= self.mean_ @ self.components_.T
+        if normalize:
+            Y = (Y - self.pca_descriptors_min) / (self.pca_descriptors_max - self.pca_descriptors_min)
+        return Y
+
+    def cuda(self):
+        self.mean_ = self.mean_.cuda()
+        self.components_ = self.components_.cuda()
+        self.pca_descriptors_min = self.pca_descriptors_min.cuda()
+        self.pca_descriptors_max = self.pca_descriptors_max.cuda()
+        return self
+    
+    def to(self, device, dtype=None):
+        self.mean_ = self.mean_.to(device, dtype=dtype)
+        self.components_ = self.components_.to(device, dtype=dtype)
+        self.pca_descriptors_min = self.pca_descriptors_min.to(device, dtype=dtype)
+        self.pca_descriptors_max = self.pca_descriptors_max.to(device, dtype=dtype)
+        return self
+
+
+def get_pca_from_feature_space(features, subsample_factor=1, max_num_features=None, n_components=3, which_pca_components=None, min_max_per_component=True):
+    # features must have channels in last dimension
+    
+    c = features.shape[-1]
+    features = features.detach().cpu().numpy() if not isinstance(features, np.ndarray) else features
+    features = features.reshape(-1, c)
+    
+    assert not (subsample_factor > 1 and max_num_features is not None), "Cannot use subsample_factor and max_num_features at the same time."
+    if subsample_factor > 1:
+        subsampled_features = features[::subsample_factor]
+    elif max_num_features is not None:
+        if max_num_features < features.shape[0]:
+            idx = np.random.choice(features.shape[0], max_num_features, replace=False)
+            subsampled_features = features[idx]
+        else:
+            subsampled_features = features
+    else:
+        subsampled_features = features
+    
+    pca = PCA(n_components=n_components).fit(subsampled_features)
+    
+    pca_descriptors = pca.transform(features)  # shape (N, n_components)
+    pca_descriptors_max = pca_descriptors.max(0 if min_max_per_component else None)
+    pca_descriptors_min = pca_descriptors.min(0 if min_max_per_component else None)
+    
+    pca = PCAWrapper(pca, which_pca_components=which_pca_components, pca_descriptors_min=pca_descriptors_min, pca_descriptors_max=pca_descriptors_max)
+    return pca
+
 
 def get_dataloaders(args):
     if args.dataset == "pascal_voc12":
@@ -41,12 +119,11 @@ def get_dataloaders(args):
         print("Not available dataset")
 
 
-    train_sampler = torch.utils.data.DistributedSampler(train_dataset, num_replicas=args.gpus, rank=args.gpu, shuffle=True)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        sampler=train_sampler,
-        batch_size=args.batch_size // args.gpus,
-        num_workers=5,      # cpu per gpu
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.train_workers,      # cpu per gpu
         drop_last=True,
         pin_memory=True,
     )
@@ -54,7 +131,7 @@ def get_dataloaders(args):
     val_dataloader = torch.utils.data.DataLoader(val_dataset, 
         batch_size=1,
         shuffle=False, 
-        num_workers=5, 
+        num_workers=args.val_workers,  # cpu per gpu
         drop_last=False, 
         pin_memory=True)
      
@@ -260,14 +337,24 @@ def restart_from_checkpoint(args, run_variables, **kwargs):
                 run_variables[var_name] = checkpoint[var_name]
 
 def get_scheduler(args, optimizer, train_loader):
-    T_max = len(train_loader) * args.num_epochs
-    warmup_steps = int(T_max * 0.05)
-    steps = T_max - warmup_steps
-    gamma = math.exp(math.log(0.5) / (steps // 3))
+    warmup_steps = 10000
+    decay_rate = 0.5
+    decay_steps = 100000
 
-    linear_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-5, total_iters=warmup_steps)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[linear_scheduler, scheduler], milestones=[warmup_steps])
+    if args.use_dinosaur_lr_schedule:
+        def lr_lambda(step):
+            warmup_factor = min(1.0, step / warmup_steps)
+            if step < warmup_steps:
+                return warmup_factor
+            else:
+                return warmup_factor * (decay_rate ** ((step - warmup_steps) / decay_steps))
+    else:
+        def lr_lambda(step):
+            warmup_factor = min(step / warmup_steps, 1.0)
+            decay_factor = decay_rate ** (step / decay_steps)
+            return warmup_factor * decay_factor
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     return scheduler
 
 def get_params_groups(model):
@@ -364,6 +451,7 @@ def setup_for_distributed(is_master):
     __builtin__.print = print
 
 def fix_random_seeds(seed):
+    random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)

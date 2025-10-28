@@ -1,0 +1,86 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train AdaSlot Stage 1 COCO",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--model_save_path", "/tmp/debug_adaslot_stage_1",
+                // "--log_wandb",  // uncomment to debug including wandb logging
+                "--exp_id", "DEBUG_ADASLOT_COCO_STAGE_1",
+                "--comment", "Debugging: Training AdaSlot Stage 1 on COCO",
+                "--dataset", "coco",
+                "--root", "/path/to/coco",  // Change this!
+                "--encoder", "dino-vitb-16",
+                "--num_iters", "200000",
+                "--batch_size", "4",
+                "--resize_to", "224", "224",
+                "--train_workers", "12",
+                "--val_workers", "4",
+                "--val_qual_interval", "10",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train AdaSlot Stage 2 COCO",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--model_save_path", "/tmp/debug_adaslot_stage_2",
+                // "--log_wandb",  // uncomment to debug including wandb logging
+                "--exp_id", "DEBUG_ADASLOT_COCO_STAGE_2",
+                "--comment", "Debugging: Training AdaSlot Stage 2 on COCO",
+                "--dataset", "coco",
+                "--root", "/path/to/coco",  // Change this!
+                "--encoder", "dino-vitb-16",
+                "--num_slots", "33",
+                "--use_adaptive_slot_attention",
+                "--use_sparsity_loss",
+                "--num_iters", "500000",
+                "--batch_size", "4",
+                "--resize_to", "224", "224",
+                "--train_workers", "12",
+                "--val_workers", "4",
+                "--val_qual_interval", "10",
+                "--warmstart_checkpoint", "/path/to/stage1/output/dir/checkpoints/dinosaur_training-iter-000200000.pt"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train DINOSAUR COCO",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train.py",
+            "args": [
+                "--model_save_path", "/tmp/debug_dinosaur",
+                // "--log_wandb",  // uncomment to debug including wandb logging
+                "--exp_id", "DEBUG_DINOSAUR_COCO",
+                "--comment", "Debugging: Training DINOSAUR on COCO",
+                "--dataset", "coco",
+                "--root", "/path/to/coco",  // Change this!
+                "--encoder", "dino-vitb-16",
+                "--num_iters", "500000",
+                "--batch_size", "4",
+                "--resize_to", "224", "224",
+                "--train_workers", "12",
+                "--val_workers", "4",
+                "--val_qual_interval", "10",
+                "--use_dinosaur_lr_schedule"
+            ],
+            "console": "integratedTerminal"
+        },
+    ]
+}
